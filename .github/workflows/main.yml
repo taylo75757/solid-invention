@@ -13,7 +13,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
@@ -23,36 +23,32 @@ jobs:
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
           if (-not (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
+              New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          } else {
+              Set-LocalUser -Name "TOOLBOXLAP" -Password $securePass
           }
 
-          Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP"
+          Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP" -ErrorAction SilentlyContinue
 
           echo "RDP_CREDS=User: TOOLBOXLAP | Password: $password" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name "TOOLBOXLAP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="tskey-auth-kAeF5sRd8221CNTRL-epukZnWACV5jo6wpyE11V5DbMY6rwRrVN" --accept-routes
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="tskey-auth-kAeF5sRd8221CNTRL-epukZnWACV5jo6wpyE11V5DbMY6rwRrVN" --accept-routes --hostname="gh-runner-$env:GITHUB_RUN_ID"
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 12) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          while (-not $tsIP -and $retries -lt 15) {
               Start-Sleep -Seconds 5
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
               $retries++
           }
           if (-not $tsIP) {
@@ -60,11 +56,12 @@ jobs:
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP assigned: $tsIP"
 
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
@@ -74,23 +71,42 @@ jobs:
       - name: Setup and Start SOCKS5 Proxy Server (Port 1080)
         run: |
           netsh advfirewall firewall add rule name="Proxy1080" dir=in action=allow protocol=TCP localport=1080
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
           $gostUrl = "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-windows-amd64-2.11.5.zip"
           $zipPath = "$env:TEMP\gost.zip"
-          Invoke-WebRequest -Uri $gostUrl -OutFile $zipPath
-          Expand-Archive -Path $zipPath -DestinationPath "$env:TEMP\gost" -Force
-          $gostExe = Get-ChildItem -Path "$env:TEMP\gost" -Filter "gost.exe" -Recurse | Select-Object -ExpandProperty FullName
-          Start-Process $gostExe -ArgumentList "-L=socks5://:1080" -WindowStyle Hidden
+          $destPath = "$env:TEMP\gost_extracted"
+
+          if (Test-Path $destPath) { Remove-Item $destPath -Recurse -Force }
+          New-Item -ItemType Directory -Path $destPath -Force | Out-Null
+
+          Invoke-WebRequest -Uri $gostUrl -OutFile $zipPath -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+          Expand-Archive -Path $zipPath -DestinationPath $destPath -Force
+
+          $exe = (Get-ChildItem -Path $destPath -Recurse -Filter "*.exe" | Select-Object -First 1).FullName
+
+          if (-not $exe -or -not (Test-Path $exe)) {
+              Write-Error "Could not find Gost executable after extract."
+              Get-ChildItem -Path $destPath -Recurse | Write-Host
+              exit 1
+          }
+
+          Write-Host "Running proxy from: $exe"
+          Start-Process -FilePath $exe -ArgumentList "-L=socks5://:1080" -WindowStyle Hidden
+          Start-Sleep -Seconds 2
           Write-Host "=== SOCKS5 Proxy is now active on port 1080 ==="
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP & PROXY ACCESS ==="
+          Write-Host ""
+          Write-Host "=== RDP & PROXY ACCESS ==="
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "SOCKS5 Proxy Port: 1080"
           Write-Host "RDP Username: TOOLBOXLAP"
           Write-Host "RDP Password: admin@123"
-          Write-Host "==========================`n"
+          Write-Host "=========================="
+          Write-Host ""
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP & SOCKS5 Proxy Active..."
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP & SOCKS5 Proxy Active..."
               Start-Sleep -Seconds 300
           }
